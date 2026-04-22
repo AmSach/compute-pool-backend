@@ -6,23 +6,23 @@ import enum
 
 Base = declarative_base()
 
+class UserTier(str, enum.Enum):
+    STANDARD = "STANDARD"
+    PREMIUM = "PREMIUM"
+    GOD = "GOD"
+
 class NodeStatus(str, enum.Enum):
-    ONLINE = "online"
-    BUSY = "busy"
-    OFFLINE = "offline"
+    ONLINE = "ONLINE"
+    BUSY = "BUSY"
+    OFFLINE = "OFFLINE"
 
 class JobStatus(str, enum.Enum):
-    PENDING = "pending"
-    ASSIGNED = "assigned"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-class UserTier(str, enum.Enum):
-    STANDARD = "standard"
-    PREMIUM = "premium"
-    GOD = "god"
+    PENDING = "PENDING"
+    ASSIGNED = "ASSIGNED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 class User(Base):
     __tablename__ = "users"
@@ -56,7 +56,7 @@ class Node(Base):
 class Job(Base):
     __tablename__ = "jobs"
     id = Column(String, primary_key=True)
-    type = Column(String, nullable=False)  # ml, compute, gaming
+    type = Column(String, nullable=False)
     status = Column(SAEnum(JobStatus), default=JobStatus.PENDING)
     submitter_id = Column(String, ForeignKey("users.id"))
     assigned_node_id = Column(String, ForeignKey("nodes.id"), nullable=True)
@@ -78,7 +78,7 @@ class Transaction(Base):
     __tablename__ = "transactions"
     id = Column(String, primary_key=True)
     user_id = Column(String, ForeignKey("users.id"))
-    type = Column(String, nullable=False)  # topup, spend, earn, cashout
+    type = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
     job_id = Column(String, ForeignKey("jobs.id"), nullable=True)
     balance_after = Column(Float, nullable=False)
