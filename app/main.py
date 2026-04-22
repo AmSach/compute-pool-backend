@@ -1,16 +1,20 @@
 from fastapi import FastAPI, Depends, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy import and_, create_engine
 from datetime import datetime, timedelta
 from typing import Optional
 import uuid, hashlib, os
 
-from app.config import get_settings
-from app.database import get_db, engine
+from app.database import get_db
 from app.models import Base, User, Node, Job, Transaction, AuditLog, NodeStatus, JobStatus, UserTier
 
-settings = get_settings()
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://neondb_owner:npg_cNbr6p8mPvqH@ep-frosty-rice-aoea3obe.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
+)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5)
+
 app = FastAPI(title="ComputePool API", version="0.1.0")
 
 app.add_middleware(
@@ -25,232 +29,236 @@ GPU_MULT = {
     "gtx-1080ti": 1.5, "gtx-1080": 1.5, "gtx-1660": 1.3, "cpu": 0.8
 }
 GEO_RATE = {"in": 0.7, "india": 0.7, "us": 1.0, "uk": 1.0, "eu": 0.95}
+PLATFORM_FEE = 0.20
+CASHIOUT_MIN = 500.0
 
 def qs(g: str) -> float: return GPU_MULT.get(g.lower(), 1.0)
 def gr(r: str) -> float: return GEO_RATE.get(r.lower(), 1.0)
-def uid() -> str: return uuid.uuid4().hex[:16]
-def log(db: Session, ltype: str, data: dict):
-    db.add(AuditLog(id=uid(), type=ltype, data=data))
-    db.commit()
 
-# ── AUTH ──────────────────────────────────────────────────────────
+def audit(db: Session, log_type: str, data: dict):
+    log = AuditLog(id=uuid.uuid4().hex[:12], type=log_type, data=data)
+    db.add(log)
+
+# ── STATUS ────────────────────────────────────────────────
+@app.get("/status")
+def status_endpoint():
+    return {"name": "ComputePool API", "version": "0.1.0", "status": "running"}
+
+# ── AUTH ─────────────────────────────────────────────────
 @app.post("/auth/register")
-def register(payload: dict, db: Session = Depends(get_db)):
-    user_id = payload.get("userId") or payload.get("user_id")
-    name = payload.get("name")
-    region = payload.get("region", "in")
-    if not user_id or not name: raise HTTPException(400, "userId and name required")
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        user = User(id=user_id, name=name, region=region, tier=UserTier.GOD if user_id == "god" else UserTier.STANDARD)
-        db.add(user); db.commit(); db.refresh(user)
-    token = hashlib.sha256(f"{user_id}{datetime.utcnow()}".encode()).hexdigest()
-    return {"token": token, "userId": user.id, "tier": user.tier.value, "balance": user.balance}
+def register(user_id: str, name: str, region: str = "in", db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.id == user_id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="User already exists")
+    tier = UserTier.GOD if user_id == "god" else UserTier.STANDARD
+    user = User(id=user_id, name=name, tier=tier, balance=0, region=region)
+    db.add(user)
+    audit(db, "user_registered", {"user_id": user_id, "name": name})
+    db.commit()
+    return {"user_id": user_id, "tier": tier.value, "balance": 0}
 
 @app.post("/auth/login")
-def login(payload: dict, db: Session = Depends(get_db)):
-    user_id = payload.get("userId") or payload.get("user_id")
-    if not user_id: raise HTTPException(400, "userId required")
+def login(user_id: str, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
-    if not user: raise HTTPException(404, "User not found")
-    token = hashlib.sha256(f"{user_id}{datetime.utcnow()}".encode()).hexdigest()
-    return {"token": token, "userId": user.id, "tier": user.tier.value, "balance": user.balance}
+    if not user:
+        user = User(id=user_id, name=user_id, tier=UserTier.STANDARD)
+        db.add(user)
+        db.commit()
+    return {"user_id": user.id, "tier": user.tier.value, "balance": user.balance}
 
-@app.get("/auth/me")
-def me(token: str = Query(...), db: Session = Depends(get_db)):
-    # Token lookup simplified; in prod, store sessions in DB
-    if not token: raise HTTPException(401, "No token")
-    return {"status": "ok"}  # Simplified; plug in session table
+@app.get("/users/{user_id}")
+def get_user(user_id: str, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"id": user.id, "name": user.name, "tier": user.tier.value,
+            "balance": user.balance, "earned_total": user.earned_total,
+            "spent_total": user.spent_total, "region": user.region}
 
-# ── NODES ─────────────────────────────────────────────────────────
+# ── NODES ────────────────────────────────────────────────
 @app.post("/nodes/register")
-def register_node(payload: dict, db: Session = Depends(get_db)):
-    node_name = payload.get("nodeName") or payload.get("node_name")
-    gpu_tier = payload.get("gpuTier") or payload.get("gpu_tier")
-    owner_id = payload.get("ownerId") or payload.get("owner_id")
-    cpu_cores = payload.get("cpuCores", 4)
-    ram_gb = payload.get("ramGb", 8)
-    region = payload.get("region", "in")
-    if not node_name or not gpu_tier or not owner_id: raise HTTPException(400, "nodeName, gpuTier, ownerId required")
-    owner = db.query(User).filter(User.id == owner_id).first()
-    if not owner: raise HTTPException(404, "Owner not found")
-    node_id = uid()
-    q = qs(gpu_tier)
-    node = Node(id=node_id, name=node_name, owner_id=owner_id, gpu_tier=gpu_tier,
-                cpu_cores=cpu_cores, ram_gb=ram_gb, quality_score=q, status=NodeStatus.ONLINE,
-                region=region, last_heartbeat=datetime.utcnow())
-    db.add(node); db.commit()
-    log(db, "node_registered", {"nodeId": node_id, "nodeName": node_name, "gpuTier": gpu_tier, "qualityScore": q})
-    return {"nodeId": node_id, "qualityScore": q, "message": "Node registered"}
+def register_node(node_name: str, gpu_tier: str, owner_id: str,
+                  cpu_cores: int = 4, ram_gb: int = 8, region: str = "in",
+                  db: Session = Depends(get_db)):
+    node_id = uuid.uuid4().hex[:12]
+    quality = qs(gpu_tier)
+    node = Node(id=node_id, name=node_name, gpu_tier=gpu_tier, owner_id=owner_id,
+                cpu_cores=cpu_cores, ram_gb=ram_gb, quality_score=quality,
+                status=NodeStatus.ONLINE, region=region)
+    db.add(node)
+    audit(db, "node_registered", {"node_id": node_id, "owner_id": owner_id})
+    db.commit()
+    return {"node_id": node_id, "quality_score": quality}
 
 @app.post("/nodes/heartbeat")
-def heartbeat(payload: dict, db: Session = Depends(get_db)):
-    node_id = payload.get("nodeId") or payload.get("node_id")
+def heartbeat(node_id: str, status: str = None, db: Session = Depends(get_db)):
     node = db.query(Node).filter(Node.id == node_id).first()
-    if not node: raise HTTPException(404, "Node not found")
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
     node.last_heartbeat = datetime.utcnow()
-    if payload.get("status"): node.status = NodeStatus(payload["status"])
+    if status:
+        node.status = NodeStatus(status.upper())
     db.commit()
-    return {"ok": True, "time": node.last_heartbeat.isoformat()}
+    return {"ok": True}
 
 @app.get("/nodes")
 def list_nodes(db: Session = Depends(get_db)):
-    cutoff = datetime.utcnow() - timedelta(seconds=90)
     nodes = db.query(Node).all()
-    result = []
-    for n in nodes:
-        online = n.last_heartbeat > cutoff and n.status != NodeStatus.OFFLINE
-        result.append({
-            "id": n.id, "name": n.name, "ownerId": n.owner_id, "gpuTier": n.gpu_tier,
-            "cpuCores": n.cpu_cores, "ramGb": n.ram_gb, "qualityScore": n.quality_score,
-            "status": n.status.value, "region": n.region, "online": online
-        })
-    return {"nodes": result, "count": len(result)}
+    return {"nodes": [{"id": n.id, "name": n.name, "gpu_tier": n.gpu_tier,
+                       "owner_id": n.owner_id, "status": n.status.value,
+                       "quality_score": n.quality_score, "region": n.region,
+                       "online": (datetime.utcnow() - n.last_heartbeat).seconds < 90
+                       } for n in nodes], "count": len(nodes)}
 
 @app.get("/nodes/{node_id}")
 def get_node(node_id: str, db: Session = Depends(get_db)):
     node = db.query(Node).filter(Node.id == node_id).first()
-    if not node: raise HTTPException(404, "Node not found")
-    return {"node": {"id": node.id, "name": node.name, "gpuTier": node.gpu_tier, "status": node.status.value, "qualityScore": node.quality_score}}
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    return {"node": {"id": node.id, "name": node.name, "gpu_tier": node.gpu_tier,
+                     "owner_id": node.owner_id, "status": node.status.value,
+                     "quality_score": node.quality_score}}
 
-# ── JOBS ──────────────────────────────────────────────────────────
+# ── JOBS ────────────────────────────────────────────────
 @app.post("/jobs/submit")
-def submit_job(payload: dict, db: Session = Depends(get_db)):
-    job_type = payload.get("type")
-    submitter_id = payload.get("submitterId") or payload.get("submitter_id")
-    slices = payload.get("slices", 1)
-    priority = payload.get("priority", 0)
-    script = payload.get("script")
-    if not job_type or not submitter_id: raise HTTPException(400, "type and submitterId required")
+def submit_job(type: str, submitter_id: str, script: str = None,
+                slices: int = 1, priority: int = 0,
+                db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == submitter_id).first()
-    if not user: raise HTTPException(404, "Submitter not found")
-    gpu_cost = 2.5 if job_type == "ml" else 3.0 if job_type == "gaming" else 1.0
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    gpu_cost = {"ml": 2.5, "gaming": 3.0, "compute": 1.0}.get(type.lower(), 1.0)
     cost = slices * gpu_cost * gr(user.region)
     final_cost = 0.0 if user.tier == UserTier.GOD else cost
     if user.tier != UserTier.GOD and user.balance < final_cost:
-        raise HTTPException(400, f"Insufficient credits. Required: {final_cost}, Balance: {user.balance}")
-    job_id = uid()
-    job = Job(id=job_id, type=job_type, submitter_id=submitter_id, script=script,
-              slices=slices, credits_cost=final_cost, priority=priority, status=JobStatus.PENDING)
+        raise HTTPException(status_code=400, detail=f"Insufficient credits. Need {final_cost}, have {user.balance}")
+    job_id = uuid.uuid4().hex[:12]
+    job = Job(id=job_id, type=type, status=JobStatus.PENDING, submitter_id=submitter_id,
+              script=script, slices=slices, credits_cost=final_cost, priority=priority)
     db.add(job)
     if user.tier != UserTier.GOD:
         user.balance -= final_cost
         user.spent_total += final_cost
-        db.add(Transaction(id=uid(), user_id=submitter_id, type="spend", amount=final_cost,
-                          balance_after=user.balance, description=f"Job {job_id} submitted"))
+        tx = Transaction(id=uuid.uuid4().hex[:12], user_id=submitter_id, type="spend",
+                         amount=-final_cost, balance_after=user.balance,
+                         description=f"Job {job_id} submitted")
+        db.add(tx)
+    audit(db, "job_submitted", {"job_id": job_id, "type": type, "submitter_id": submitter_id})
     db.commit()
-    log(db, "job_submitted", {"jobId": job_id, "type": job_type, "submitterId": submitter_id, "creditsCost": final_cost})
-    return {"jobId": job_id, "status": "pending", "estimatedCost": final_cost}
-
-@app.get("/jobs/next")
-def next_job(node_id: str = Query(...), db: Session = Depends(get_db)):
-    node = db.query(Node).filter(Node.id == node_id).first()
-    if not node: raise HTTPException(404, "Node not found")
-    pending = db.query(Job).filter(Job.status == JobStatus.PENDING).order_by(Job.priority.desc(), Job.created_at).first()
-    if not pending: return {"job": None}
-    pending.status = JobStatus.ASSIGNED
-    pending.assigned_node_id = node_id
-    node.status = NodeStatus.BUSY
-    db.commit()
-    log(db, "job_assigned", {"jobId": pending.id, "nodeId": node_id})
-    return {"job": {
-        "id": pending.id, "type": pending.type, "status": pending.status.value,
-        "script": pending.script, "slices": pending.slices, "priority": pending.priority
-    }}
-
-@app.post("/jobs/{job_id}/complete")
-def complete_job(job_id: str, payload: dict, db: Session = Depends(get_db)):
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job: raise HTTPException(404, "Job not found")
-    error = payload.get("error")
-    job.status = JobStatus.FAILED if error else JobStatus.COMPLETED
-    job.completed_at = datetime.utcnow()
-    job.result_cid = payload.get("resultCid")
-    job.error = error
-    if job.assigned_node_id:
-        node = db.query(Node).filter(Node.id == job.assigned_node_id).first()
-        if node: node.status = NodeStatus.ONLINE
-    if not error and job.assigned_node_id and job.credits_cost > 0:
-        node = db.query(Node).filter(Node.id == job.assigned_node_id).first()
-        if node:
-            earn_mult = qs(node.gpu_tier) * gr(node.region)
-            earned = job.credits_cost * earn_mult * (1 - settings.PLATFORM_FEE)
-            owner = db.query(User).filter(User.id == node.owner_id).first()
-            if owner:
-                owner.balance += earned
-                owner.earned_total += earned
-                db.add(Transaction(id=uid(), user_id=owner.id, type="earn", amount=earned,
-                                  job_id=job_id, balance_after=owner.balance,
-                                  description=f"Earnings for job {job_id}"))
-    db.commit()
-    log(db, "job_completed", {"jobId": job_id, "status": job.status.value})
-    return {"ok": True}
+    return {"job_id": job_id, "status": "PENDING", "estimated_cost": final_cost}
 
 @app.get("/jobs")
-def list_jobs(status: Optional[str] = None, submitter_id: Optional[str] = None, db: Session = Depends(get_db)):
+def list_jobs(status: str = None, submitter_id: str = None, db: Session = Depends(get_db)):
     q = db.query(Job)
-    if status: q = q.filter(Job.status == JobStatus(status))
-    if submitter_id: q = q.filter(Job.submitter_id == submitter_id)
+    if status:
+        q = q.filter(Job.status == JobStatus(status.upper()))
+    if submitter_id:
+        q = q.filter(Job.submitter_id == submitter_id)
     jobs = q.order_by(Job.created_at.desc()).all()
-    return {"jobs": [{"id": j.id, "type": j.type, "status": j.status.value, "submitterId": j.submitter_id,
-                      "assignedNodeId": j.assigned_node_id, "creditsCost": j.credits_cost,
-                      "createdAt": j.created_at.isoformat()} for j in jobs], "count": len(jobs)}
+    return {"jobs": [{"id": j.id, "type": j.type, "status": j.status.value,
+                      "submitter_id": j.submitter_id, "assigned_node_id": j.assigned_node_id,
+                      "credits_cost": j.credits_cost, "created_at": j.created_at.isoformat()
+                      } for j in jobs], "count": len(jobs)}
+
+@app.get("/jobs/next")
+def next_job(node_id: str, db: Session = Depends(get_db)):
+    node = db.query(Node).filter(Node.id == node_id).first()
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    job = db.query(Job).filter(Job.status == JobStatus.PENDING).order_by(Job.priority.desc(), Job.created_at.asc()).first()
+    if not job:
+        return {"job": None, "message": "No jobs available"}
+    job.status = JobStatus.ASSIGNED
+    job.assigned_node_id = node_id
+    job.started_at = datetime.utcnow()
+    node.status = NodeStatus.BUSY
+    audit(db, "job_assigned", {"job_id": job.id, "node_id": node_id})
+    db.commit()
+    return {"job": {"id": job.id, "type": job.type, "script": job.script, "slices": job.slices}}
+
+@app.post("/jobs/complete")
+def complete_job(job_id: str, result_cid: str = None, error: str = None, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job.status = JobStatus.FAILED if error else JobStatus.COMPLETED
+    job.result_cid = result_cid
+    job.error = error
+    job.completed_at = datetime.utcnow()
+    if job.assigned_node_id:
+        node = db.query(Node).filter(Node.id == job.assigned_node_id).first()
+        if node:
+            node.status = NodeStatus.ONLINE
+            # Pay node owner
+            if job.credits_cost > 0 and not error:
+                earn_mult = qs(node.gpu_tier) * gr(node.region)
+                earned = job.credits_cost * earn_mult * (1 - PLATFORM_FEE)
+                owner = db.query(User).filter(User.id == node.owner_id).first()
+                if owner:
+                    owner.balance += earned
+                    owner.earned_total += earned
+                    tx = Transaction(id=uuid.uuid4().hex[:12], user_id=node.owner_id, type="earn",
+                                     amount=earned, balance_after=owner.balance,
+                                     job_id=job_id, description=f"Job {job_id} completed")
+                    db.add(tx)
+    audit(db, "job_completed", {"job_id": job_id, "error": error})
+    db.commit()
+    return {"ok": True}
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id).first()
-    if not job: raise HTTPException(404, "Job not found")
-    return {"job": {"id": job.id, "type": job.type, "status": job.status.value, "creditsCost": job.credits_cost}}
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job": {"id": job.id, "type": job.type, "status": job.status.value,
+                    "submitter_id": job.submitter_id, "assigned_node_id": job.assigned_node_id,
+                    "credits_cost": job.credits_cost}}
 
-# ── CREDITS ───────────────────────────────────────────────────────
+# ── CREDITS ─────────────────────────────────────────────
 @app.post("/credits/topup")
-def topup(payload: dict, db: Session = Depends(get_db)):
-    user_id = payload.get("userId") or payload.get("user_id")
-    amount = float(payload.get("amount", 0))
-    if not user_id or amount <= 0: raise HTTPException(400, "userId and amount required")
+def topup(user_id: str, amount: float, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
-    if not user: raise HTTPException(404, "User not found")
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     user.balance += amount
-    db.add(Transaction(id=uid(), user_id=user_id, type="topup", amount=amount, balance_after=user.balance))
+    tx = Transaction(id=uuid.uuid4().hex[:12], user_id=user_id, type="topup",
+                     amount=amount, balance_after=user.balance, description="Top up")
+    db.add(tx)
+    audit(db, "topup", {"user_id": user_id, "amount": amount})
     db.commit()
     return {"ok": True, "balance": user.balance}
-
-@app.post("/credits/cashout")
-def cashout(payload: dict, db: Session = Depends(get_db)):
-    user_id = payload.get("userId") or payload.get("user_id")
-    amount = float(payload.get("amount", 0))
-    if not user_id or amount <= 0: raise HTTPException(400, "userId and amount required")
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user: raise HTTPException(404, "User not found")
-    if user.balance < settings.CASHIOUT_MIN: raise HTTPException(400, f"Minimum cashout Rs.{settings.CASHIOUT_MIN}")
-    if user.balance < amount: raise HTTPException(400, "Insufficient balance")
-    user.balance -= amount
-    db.add(Transaction(id=uid(), user_id=user_id, type="cashout", amount=amount, balance_after=user.balance))
-    db.commit()
-    return {"ok": True, "message": f"Cashout Rs.{amount} requested. 24-48hrs."}
 
 @app.get("/credits/{user_id}")
 def get_credits(user_id: str, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id).first()
-    if not user: raise HTTPException(404, "User not found")
-    return {"userId": user.id, "balance": user.balance, "earnedTotal": user.earned_total, "tier": user.tier.value}
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"user_id": user.id, "balance": user.balance, "earned_total": user.earned_total,
+            "spent_total": user.spent_total}
 
-@app.get("/credits/leaderboard")
+@app.get("/credits/leaderboard/top")
 def leaderboard(db: Session = Depends(get_db)):
     users = db.query(User).filter(User.tier != UserTier.GOD).order_by(User.earned_total.desc()).limit(20).all()
-    return {"leaderboard": [{"userId": u.id, "earnedTotal": round(u.earned_total, 2)} for u in users]}
+    return {"leaderboard": [{"user_id": u.id, "earned_total": round(u.earned_total, 2)} for u in users]}
 
-# ── STATUS ────────────────────────────────────────────────────────
-@app.get("/status")
-def status(db: Session = Depends(get_db)):
-    return {
-        "name": "ComputePool Hub", "version": "0.1.0", "status": "running",
-        "nodes": db.query(Node).count(), "jobs": db.query(Job).count()
-    }
+@app.post("/credits/cashout")
+def cashout(user_id: str, amount: float, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.balance < amount:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+    if amount < CASHIOUT_MIN:
+        raise HTTPException(status_code=400, detail=f"Minimum cashout Rs.{CASHIOUT_MIN}")
+    user.balance -= amount
+    tx = Transaction(id=uuid.uuid4().hex[:12], user_id=user_id, type="cashout",
+                     amount=-amount, balance_after=user.balance, description="Cashout requested")
+    db.add(tx)
+    audit(db, "cashout", {"user_id": user_id, "amount": amount})
+    db.commit()
+    return {"ok": True, "message": f"Cashout Rs.{amount} requested. 24-48hrs."}
 
 @app.get("/logs")
-def logs(limit: int = 50, ltype: Optional[str] = None, db: Session = Depends(get_db)):
-    q = db.query(AuditLog)
-    if ltype: q = q.filter(AuditLog.type == ltype)
-    logs = q.order_by(AuditLog.created_at.desc()).limit(limit).all()
-    return {"logs": [{"type": l.type, "data": l.data, "ts": l.created_at.isoformat()} for l in logs], "count": len(logs)}
+def get_logs(limit: int = 50, db: Session = Depends(get_db)):
+    logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit).all()
+    return {"logs": [{"type": l.type, "data": l.data, "created_at": l.created_at.isoformat()} for l in logs]}
